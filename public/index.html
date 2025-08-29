@@ -2,109 +2,232 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Bus Realtime</title>
+  <title>Fleet Live Map</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    html, body, #map { height: 100%; margin: 0; padding: 0; }
-    .label {
-      background: #0b5; color: #fff; padding: 2px 6px; border-radius: 12px;
-      font: 12px/18px system-ui, Arial, sans-serif; white-space: nowrap;
-      border: 1px solid rgba(0,0,0,0.15); box-shadow: 0 1px 2px rgba(0,0,0,0.15);
-    }
-    .toast {
-      position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
-      background: rgba(0,0,0,0.7); color: #fff; padding: 6px 10px; border-radius: 6px; font: 12px system-ui;
-      z-index: 2; display: none;
-    }
+    html, body { height: 100%; margin: 0; font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color: #111; }
+    .app { display: grid; grid-template-rows: 56px 1fr; height: 100%; }
+    .topbar { display: flex; align-items: center; gap: 16px; padding: 0 16px; border-bottom: 1px solid #e5e7eb; background: #fff; position: sticky; top: 0; z-index: 10; }
+    .brand { font-weight: 600; font-size: 16px; }
+    .stat { margin-left: auto; font-weight: 600; }
+    .content { display: grid; grid-template-columns: 300px 1fr; min-height: 0; }
+    .sidebar { border-right: 1px solid #e5e7eb; display: flex; flex-direction: column; min-width: 240px; background: #fafafa; }
+    .search { padding: 10px; border-bottom: 1px solid #e5e7eb; }
+    .search input { width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 8px; outline: none; }
+    .list { overflow: auto; }
+    .item { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid #eee; cursor: pointer; background: #fff; }
+    .item:hover { background: #f5f5f5; }
+    .item .meta { font-size: 12px; color: #555; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 10px; font-size: 11px; color: #fff; }
+    .badge.ok { background: #059669; }      /* active */
+    .badge.stale { background: #9ca3af; }   /* inactive */
+    #map { width: 100%; height: 100%; }
+    .pin { background: #2563eb; color: #fff; padding: 2px 6px; border-radius: 12px; font: 12px/18px system-ui; white-space: nowrap; border: 1px solid rgba(0,0,0,0.15); box-shadow: 0 1px 2px rgba(0,0,0,0.15); }
+    .ghost { opacity: 0.5; }
+    .toast { position: absolute; top: 70px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.75); color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 12px; z-index: 20; display: none; }
     .toast.show { display: inline-block; }
   </style>
-  <!-- Google Maps JS API: uses your billed API key -->
   <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyByVXu-kDUu9iYS3HJ9UE4fmLmAn485mY0&v=weekly"></script>
 </head>
 <body>
-  <div class="toast" id="toast">Connecting…</div>
-  <div id="map"></div>
+<div class="app">
+  <div class="topbar">
+    <div class="brand">Fleet Live</div>
+    <div class="stat">Active buses: <span id="activeCount">0</span></div>
+  </div>
+  <div class="content">
+    <aside class="sidebar">
+      <div class="search">
+        <input id="q" placeholder="Search bus id..." />
+      </div>
+      <div class="list" id="list"></div>
+    </aside>
+    <div id="map"></div>
+  </div>
+</div>
+<div class="toast" id="toast">Connecting…</div>
 
-  <script>
-    let map, AdvancedMarkerElement;
-    const markers = {}; // bus_id -> AdvancedMarkerElement
-    const toast = document.getElementById("toast");
+<script>
+  // CONFIG
+  const STALE_MS = 10 * 60 * 1000; // 10 minutes: after this, consider inactive (ghost)
+  const HARD_REMOVE_MS = 24 * 60 * 60 * 1000; // 24h: hard cap to remove very old markers
+  const CENTER = { lat: 28.6139, lng: 77.2090 };
+  const WS_URL = "wss://bus-realtime.onrender.com/map"; // viewer socket
+  const MAP_ID = "ee14e5612cce433e785797ee";
 
-    function showToast(msg, ms=2000) {
-      toast.textContent = msg;
-      toast.classList.add("show");
-      setTimeout(() => toast.classList.remove("show"), ms);
+  // STATE
+  let map, AdvancedMarkerElement;
+  const buses = new Map(); // id -> { marker, lastUpdated, lat, lng, status }
+  let ws;
+
+  const els = {
+    list: document.getElementById("list"),
+    activeCount: document.getElementById("activeCount"),
+    toast: document.getElementById("toast"),
+    q: document.getElementById("q"),
+  };
+
+  function showToast(msg, ms = 1800) {
+    els.toast.textContent = msg;
+    els.toast.classList.add("show");
+    setTimeout(() => els.toast.classList.remove("show"), ms);
+  }
+
+  function fmtTime(ts) {
+    const d = new Date(ts);
+    return d.toLocaleTimeString();
+  }
+
+  function isStale(entry) {
+    if (entry.status === "stopped") return true; // intentional stop
+    return Date.now() - entry.lastUpdated > STALE_MS;
+  }
+
+  function updateActiveCount() {
+    let active = 0;
+    for (const [, entry] of buses) {
+      if (!isStale(entry)) active++;
+    }
+    els.activeCount.textContent = String(active);
+  }
+
+  function rebuildList() {
+    const query = els.q.value.trim().toLowerCase();
+    const arr = [];
+    for (const [id, entry] of buses) arr.push({ id, entry });
+    arr.sort((a, b) => a.id.localeCompare(b.id));
+    els.list.innerHTML = "";
+    for (const { id, entry } of arr) {
+      if (query && !id.toLowerCase().includes(query)) continue;
+      const stale = isStale(entry);
+      const item = document.createElement("div");
+      item.className = "item";
+      const left = document.createElement("div");
+      left.innerHTML = `<div><strong>${id}</strong></div><div class="meta">Last: ${fmtTime(entry.lastUpdated)} • ${entry.lat.toFixed(5)}, ${entry.lng.toFixed(5)}</div>`;
+      const right = document.createElement("div");
+      right.innerHTML = `<span class="badge ${stale ? "stale" : "ok"}">${stale ? (entry.status === "stopped" ? "stopped" : "inactive") : "active"}</span>`;
+      item.appendChild(left);
+      item.appendChild(right);
+      item.onclick = () => {
+        map.panTo({ lat: entry.lat, lng: entry.lng });
+        map.setZoom(15);
+      };
+      els.list.appendChild(item);
+    }
+    updateActiveCount();
+  }
+
+  function removeBusNow(id) {
+    const entry = buses.get(id);
+    if (!entry) return;
+    if (entry.marker) entry.marker.map = null;
+    buses.delete(id);
+    rebuildList();
+  }
+
+  function setGhostStyle(entry, ghost) {
+    if (!entry || !entry.marker || !entry.marker.content) return;
+    entry.marker.content.classList.toggle("ghost", !!ghost);
+  }
+
+  function upsertBus(d) {
+    const id = String(d.bus_id ?? "");
+    if (!id) return;
+
+    // Handle control messages: {bus_id, status:"stopped"} => immediate remove
+    if (d.status && String(d.status).toLowerCase() === "stopped") {
+      // Intentional stop: remove immediately
+      removeBusNow(id);
+      return;
     }
 
-    async function initMap() {
-      // Wait until Maps is loaded
-      while (!(window.google && google.maps)) {
-        await new Promise(r => setTimeout(r, 50));
-      }
+    // Regular position update
+    const pos = { lat: Number(d.lat), lng: Number(d.lng) };
+    if (!Number.isFinite(pos.lat) || !Number.isFinite(pos.lng)) return;
 
-      // Create map with your Map ID (required for Advanced Markers)
-      map = new google.maps.Map(document.getElementById("map"), {
-        center: { lat: 28.6139, lng: 77.2090 },
-        zoom: 12,
-        mapId: "ee14e5612cce433e785797ee",
-        disableDefaultUI: false,
+    let entry = buses.get(id);
+    if (!entry) {
+      const content = document.createElement("div");
+      content.className = "pin";
+      content.textContent = `Bus ${id}`;
+      const marker = new AdvancedMarkerElement({
+        map,
+        position: pos,
+        title: `Bus ${id}`,
+        content,
+        gmpClickable: true,
       });
-
-      // Load Advanced Marker library
-      const lib = await google.maps.importLibrary("marker");
-      AdvancedMarkerElement = lib.AdvancedMarkerElement;
-
-      // Connect to viewer WebSocket
-      const wsUrl = "wss://bus-realtime.onrender.com/map";
-      const ws = new WebSocket(wsUrl);
-
-      ws.onopen = () => {
-        showToast("Connected to live map", 1500);
-        console.log("WS open:", wsUrl);
-      };
-
-      ws.onmessage = (ev) => {
-        try {
-          const d = JSON.parse(ev.data);
-          const id = String(d.bus_id ?? "");
-          const lat = Number(d.lat);
-          const lng = Number(d.lng);
-          if (!id || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
-
-          const pos = { lat, lng };
-
-          // First time: create advanced marker with a simple label
-          if (!markers[id]) {
-            const content = document.createElement("div");
-            content.className = "label";
-            content.textContent = `Bus ${id}`;
-            markers[id] = new AdvancedMarkerElement({
-              map,
-              position: pos,
-              title: `Bus ${id}`,
-              content,
-            });
-          } else {
-            // Update position
-            markers[id].position = pos;
-          }
-        } catch (e) {
-          console.error("Bad WS payload", e);
-        }
-      };
-
-      ws.onerror = (e) => {
-        console.error("WS error", e);
-        showToast("WebSocket error");
-      };
-      ws.onclose = () => {
-        console.warn("WS closed");
-        showToast("Disconnected");
-      };
+      marker.addEventListener("gmp-click", () => {
+        map.panTo(marker.position);
+        map.setZoom(15);
+      });
+      entry = { marker, lastUpdated: Date.now(), lat: pos.lat, lng: pos.lng, status: "active" };
+      buses.set(id, entry);
+    } else {
+      entry.marker.position = pos;
+      entry.lastUpdated = Date.now();
+      entry.lat = pos.lat;
+      entry.lng = pos.lng;
+      entry.status = "active";
+      setGhostStyle(entry, false);
     }
+  }
 
-    // Boot
-    initMap();
-  </script>
+  // Sweeper: ghost after STALE_MS, hard-remove after HARD_REMOVE_MS (only for unintentional)
+  function sweep() {
+    const now = Date.now();
+    for (const [id, entry] of buses) {
+      const age = now - entry.lastUpdated;
+      if (entry.status === "stopped") {
+        // Intentional stop would have removed immediately in upsertBus
+        continue;
+      }
+      if (age > STALE_MS) {
+        setGhostStyle(entry, true); // dim but keep visible
+      }
+      if (age > HARD_REMOVE_MS) {
+        removeBusNow(id);
+      }
+    }
+    rebuildList();
+  }
+
+  async function initMap() {
+    while (!(window.google && google.maps)) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    map = new google.maps.Map(document.getElementById("map"), {
+      center: CENTER,
+      zoom: 12,
+      mapId: MAP_ID,
+      gestureHandling: "greedy",
+    });
+    const lib = await google.maps.importLibrary("marker");
+    AdvancedMarkerElement = lib.AdvancedMarkerElement;
+
+    // Connect viewer WebSocket
+    const ws = new WebSocket(WS_URL);
+    ws.onopen = () => showToast("Connected");
+    ws.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        // Accept either control or position payloads
+        if (!d || !("bus_id" in d)) return;
+        upsertBus(d);
+        rebuildList();
+      } catch (e) {
+        console.error("Bad WS payload", e);
+      }
+    };
+    ws.onclose = () => showToast("Disconnected");
+    ws.onerror = () => showToast("WebSocket error");
+
+    // UI
+    document.getElementById("q").addEventListener("input", rebuildList);
+    setInterval(sweep, 60 * 1000);
+  }
+
+  initMap();
+</script>
 </body>
 </html>
